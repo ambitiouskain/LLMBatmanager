@@ -9,8 +9,8 @@ from uuid import uuid4
 from .. import __version__
 
 SECRET_PATTERNS = [
-    re.compile(r"(?i)(--api-key(?:=|\s+))(\S+|\"[^\"]*\")"),
-    re.compile(r"(?i)((?:OPENAI_API_KEY|API_KEY)\s*=\s*)([^\s\r\n]+)"),
+    re.compile(r'(?i)(--api-key(?:=|\s+))("[^"]*"|\S+)'),
+    re.compile(r'(?i)((?:OPENAI_API_KEY|API_KEY)\s*=\s*)("[^"]*"|[^\s\r\n]+)'),
     re.compile(r"(?i)(Authorization:\s*Bearer\s+)(\S+)"),
 ]
 FAILURE_PATTERNS = {

@@ -1,43 +1,12 @@
 param(
     [ValidateSet("OneDir", "OneFile", "All")]
-    [string]$Mode = "OneDir",
-    [string]$OutputRoot = "",
-    [string]$VenvPath = ""
+    [string]$Mode = "OneDir"
 )
 
 $ErrorActionPreference = "Stop"
-$ProjectRoot = [System.IO.Path]::GetFullPath(
-    (Split-Path -Parent $MyInvocation.MyCommand.Path)
-)
-$ProjectParent = Split-Path -Parent $ProjectRoot
-
-if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
-    $OutputRoot = $ProjectRoot
-}
-else {
-    $OutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
-}
-if ([string]::IsNullOrWhiteSpace($VenvPath)) {
-    $VenvPath = Join-Path $ProjectParent ".LLMBatDesk-build-venv"
-}
-$VenvPath = [System.IO.Path]::GetFullPath($VenvPath)
-
-function Test-PathWithin {
-    param([string]$Child, [string]$Parent)
-    $ParentWithSeparator = $Parent.TrimEnd("\", "/") + [System.IO.Path]::DirectorySeparatorChar
-    return $Child.StartsWith(
-        $ParentWithSeparator, [System.StringComparison]::OrdinalIgnoreCase
-    )
-}
-
-if ($VenvPath -eq $ProjectRoot -or (Test-PathWithin $VenvPath $ProjectRoot)) {
-    throw "Build virtual environment must be outside the source folder: $VenvPath"
-}
-
-$VenvPython = Join-Path $VenvPath "Scripts\python.exe"
-$ResourceCompiler = Join-Path $VenvPath "Scripts\pyside6-rcc.exe"
-$BuildRoot = Join-Path $OutputRoot "build"
-$DistRoot = Join-Path $OutputRoot "dist"
+$ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$VenvPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+$ResourceCompiler = Join-Path $ProjectRoot ".venv\Scripts\pyside6-rcc.exe"
 
 function Invoke-CheckedProcess {
     param([string]$FilePath, [string[]]$Arguments)
@@ -47,56 +16,42 @@ function Invoke-CheckedProcess {
     }
 }
 
-function Clear-GeneratedPath {
-    param([string]$Path)
-    $ResolvedCandidate = [System.IO.Path]::GetFullPath($Path)
-    if (
-        $ResolvedCandidate -eq $OutputRoot -or
-        -not (Test-PathWithin $ResolvedCandidate $OutputRoot)
-    ) {
-        throw "Refusing to clear a path outside the output root: $ResolvedCandidate"
-    }
-    if (Test-Path -LiteralPath $ResolvedCandidate) {
-        Remove-Item -LiteralPath $ResolvedCandidate -Recurse -Force
-    }
-}
-
 function Test-Package {
-    param([string]$Executable)
-    if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) {
+    param([string]$Executable, [string]$DataName)
+    if (-not (Test-Path -LiteralPath $Executable)) {
         throw "Executable was not created: $Executable"
     }
-    $SmokeData = Join-Path (
-        [System.IO.Path]::GetTempPath()
-    ) ("LLMBatDesk-smoke-" + [guid]::NewGuid().ToString("N"))
     $PreviousDataDirectory = $env:LLMBATDESK_DATA_DIR
     try {
-        $env:LLMBATDESK_DATA_DIR = $SmokeData
+        $env:LLMBATDESK_DATA_DIR = Join-Path $ProjectRoot "build\$DataName"
         $SmokeProcess = Start-Process -FilePath $Executable -ArgumentList "--smoke-test" `
             -Wait -PassThru -WindowStyle Hidden
         if ($SmokeProcess.ExitCode -ne 0) {
-            throw "Packaged GUI smoke test failed with exit code $($SmokeProcess.ExitCode)"
+            throw "Packaged GUI smoke test failed with exit code $($SmokeProcess.ExitCode): $Executable"
+        }
+        $env:LLMBATDESK_DATA_DIR = Join-Path $ProjectRoot "build\$DataName-model-library"
+        $ExtensionSmoke = Start-Process -FilePath $Executable `
+            -ArgumentList "--smoke-test-model-library" -Wait -PassThru -WindowStyle Hidden
+        if ($ExtensionSmoke.ExitCode -ne 0) {
+            throw "Packaged model-library smoke test failed with exit code $($ExtensionSmoke.ExitCode): $Executable"
         }
     }
     finally {
         $env:LLMBATDESK_DATA_DIR = $PreviousDataDirectory
-        if (Test-Path -LiteralPath $SmokeData) {
-            Remove-Item -LiteralPath $SmokeData -Recurse -Force
-        }
     }
+    Invoke-CheckedProcess $VenvPython @(
+        (Join-Path $ProjectRoot "scripts\verify_windows_exe.py"),
+        $Executable
+    )
 }
 
-if (-not (Test-Path -LiteralPath $VenvPython -PathType Leaf)) {
-    python -m venv $VenvPath
-    if ($LASTEXITCODE -ne 0) {
-        throw "Unable to create build virtual environment: $VenvPath"
-    }
+if (-not (Test-Path -LiteralPath $VenvPython)) {
+    python -m venv (Join-Path $ProjectRoot ".venv")
 }
 
 Invoke-CheckedProcess $VenvPython @(
     "-m", "pip", "install", "--disable-pip-version-check",
-    "-r", (Join-Path $ProjectRoot "requirements.txt"),
-    "pyinstaller>=6.10,<7"
+    "-r", (Join-Path $ProjectRoot "requirements-dev.txt")
 )
 
 Push-Location $ProjectRoot
@@ -105,37 +60,48 @@ try {
         "src\llmbatdesk\qt\resources.qrc",
         "-o", "src\llmbatdesk\qt\resources_rc.py"
     )
+    Invoke-CheckedProcess $VenvPython @("-m", "pytest")
 
     if ($Mode -in @("OneDir", "All")) {
-        $OneDirWork = Join-Path $BuildRoot "OneDir"
-        $OneDirOutput = Join-Path $DistRoot "LLMBatDesk"
-        Clear-GeneratedPath $OneDirWork
-        Clear-GeneratedPath $OneDirOutput
         Invoke-CheckedProcess $VenvPython @(
-            "-m", "PyInstaller", "--noconfirm", "--clean",
-            "--workpath", $OneDirWork,
-            "--distpath", $DistRoot,
-            "LLMBatDesk.spec"
+            "-m", "PyInstaller", "--noconfirm", "--clean", "LLMBatDesk.spec"
         )
-        $OneDirExecutable = Join-Path $OneDirOutput "LLMBatDesk.exe"
-        Test-Package $OneDirExecutable
+        $OneDirExecutable = Join-Path $ProjectRoot "dist\LLMBatDesk\LLMBatDesk.exe"
+        Test-Package $OneDirExecutable "smoke-onedir"
         Write-Host "One-directory build complete: $OneDirExecutable"
     }
 
     if ($Mode -in @("OneFile", "All")) {
-        $OneFileWork = Join-Path $BuildRoot "OneFile"
-        $PortableRoot = Join-Path $DistRoot "portable"
-        $OneFileExecutable = Join-Path $PortableRoot "LLMBatDesk-Portable.exe"
-        Clear-GeneratedPath $OneFileWork
-        Clear-GeneratedPath $OneFileExecutable
         Invoke-CheckedProcess $VenvPython @(
             "-m", "PyInstaller", "--noconfirm", "--clean",
-            "--workpath", $OneFileWork,
-            "--distpath", $PortableRoot,
-            "LLMBatDesk-OneFile.spec"
+            "--distpath", "dist\portable", "LLMBatDesk-OneFile.spec"
         )
-        Test-Package $OneFileExecutable
+        $OneFileExecutable = Join-Path $ProjectRoot "dist\portable\LLMBatDesk-Portable.exe"
+        Test-Package $OneFileExecutable "smoke-onefile"
         Write-Host "One-file build complete: $OneFileExecutable"
+    }
+
+    if ($Mode -eq "All") {
+        $InnoCandidates = @(
+            (Get-Command "ISCC.exe" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source),
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+        ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique
+        $InnoCompiler = $InnoCandidates | Select-Object -First 1
+        if ($InnoCompiler) {
+            Invoke-CheckedProcess $InnoCompiler @("installer\LLMBatDesk.iss")
+            $Installer = Join-Path $ProjectRoot "dist\installer\LLMBatDesk-Setup.exe"
+            if (-not (Test-Path -LiteralPath $Installer)) {
+                throw "Inno Setup completed but installer was not found: $Installer"
+            }
+            Invoke-CheckedProcess $VenvPython @(
+                (Join-Path $ProjectRoot "scripts\verify_windows_exe.py"), $Installer
+            )
+            Write-Host "Installer build complete: $Installer"
+        }
+        else {
+            Write-Warning "Inno Setup is unavailable. The validated installer script remains at installer\LLMBatDesk.iss; no system software was installed."
+        }
     }
 }
 finally {

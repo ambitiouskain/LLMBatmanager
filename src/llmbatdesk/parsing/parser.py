@@ -93,6 +93,7 @@ def _locate_port_source(result: ParsedScript, text: str, context: object) -> Non
     patterns = [
         (re.compile(rf"(?im)(--port\s+)(?P<v>{re.escape(value)})(?=\s|\^|$)"), "argument"),
         (re.compile(rf"(?im)(--port=)(?P<v>{re.escape(value)})(?=\s|\^|$)"), "argument_equals"),
+        (re.compile(rf"(?im)(?<!\S)(-p\s+)(?P<v>{re.escape(value)})(?=\s|\^|$)"), "argument"),
         (re.compile(rf'(?im)(set\s+"?(?:PORT|LLAMA_PORT)=)(?P<v>{re.escape(value)})(?="?[\r\n])'),
          "environment"),
     ]

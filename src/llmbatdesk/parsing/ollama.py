@@ -4,6 +4,7 @@ from pathlib import Path
 
 from ..domain.models import Backend, Evidence, ParsedScript
 from .common import StaticContext
+from .tokenizer import LogicalLine
 
 OLLAMA_ENV = {
     "OLLAMA_HOST", "OLLAMA_KEEP_ALIVE", "OLLAMA_NUM_PARALLEL",
@@ -12,18 +13,19 @@ OLLAMA_ENV = {
 
 
 def parse_ollama(result: ParsedScript, context: StaticContext) -> bool:
-    candidate = None
+    candidates: list[tuple[LogicalLine, list[str], int]] = []
     for line, tokens in context.commands:
         index = next((i for i, t in enumerate(tokens) if Path(t).name.casefold() in
                       {"ollama", "ollama.exe"}), None)
         if index is not None and index + 1 < len(tokens) and tokens[index + 1].casefold() in {
             "serve", "run", "stop"
         }:
-            candidate = line, tokens, index
-            break
-    if not candidate:
+            candidates.append((line, tokens, index))
+    if not candidates:
         return False
-    line, tokens, index = candidate
+    if len(candidates) > 1:
+        result.dynamic_reasons.append("脚本包含多个 Ollama 命令")
+    line, tokens, index = candidates[0]
     action = tokens[index + 1].casefold()
     result.backend = Backend.OLLAMA
     result.executable = tokens[index]
@@ -47,4 +49,3 @@ def parse_ollama(result: ParsedScript, context: StaticContext) -> bool:
         reason="识别 Ollama 子命令",
     ))
     return True
-

@@ -52,10 +52,13 @@ def generate_port_override(
         raise OverrideRefused("安全校验失败：端口以外的行发生变化")
     output_dir.mkdir(parents=True, exist_ok=True)
     destination = output_dir / f"{parsed.path.stem}-{new_port}-{uuid4().hex[:8]}{parsed.path.suffix}"
-    destination.write_bytes(new_data)
-    if parsed.path.exists() and parsed.path.read_bytes() != original_data:
+    try:
+        destination.write_bytes(new_data)
+        if parsed.path.exists() and parsed.path.read_bytes() != original_data:
+            raise OverrideRefused("创建临时副本期间原脚本发生变化")
+    except Exception:
         destination.unlink(missing_ok=True)
-        raise OverrideRefused("创建临时副本期间原脚本发生变化")
+        raise
     diff = "".join(difflib.unified_diff(
         before_lines, after_lines, fromfile=str(parsed.path), tofile=str(destination)
     ))
@@ -75,4 +78,3 @@ def save_managed_copy(
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_bytes((header + text).encode(encoding))
     return destination
-

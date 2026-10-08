@@ -86,6 +86,11 @@ def run(argv: Sequence[str] | None = None, service: ApplicationService | None = 
     arguments = list(argv if argv is not None else sys.argv)
     app = create_application(arguments)
     actual_service = service or ApplicationService()
+    model_library_smoke = "--smoke-test-model-library" in arguments
+    if model_library_smoke:
+        # Packaging-only smoke path: opens the lazy page against the caller's
+        # isolated data directory but never configures or starts a scan.
+        actual_service.settings.model_library_enabled = True
     apply_theme(app, actual_service.settings.theme)
     diagnostics = dpi_diagnostics(app)
     actual_service.store.add_event(OperationEvent(kind="display_diagnostics", data={
@@ -93,6 +98,12 @@ def run(argv: Sequence[str] | None = None, service: ApplicationService | None = 
     }))
     window = MainWindow(actual_service, dpi_diagnostics=diagnostics)
     window.show()
-    if "--smoke-test" in arguments:
+    if model_library_smoke:
+        QTimer.singleShot(
+            0,
+            lambda: window.main_tabs.setCurrentIndex(1),
+        )
+        QTimer.singleShot(350, app.quit)
+    elif "--smoke-test" in arguments:
         QTimer.singleShot(150, app.quit)
     return app.exec()

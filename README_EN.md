@@ -30,7 +30,7 @@ Other BAT/CMD scripts use the generic parser. Parameter detection and API status
 
 ## Run from Source
 
-Requirements: Windows and Python 3.11 or later.
+Requirements: Windows and Python 3.12 or later.
 
 ```powershell
 git clone https://github.com/ambitiouskain/LLMBatmanager.git
@@ -89,4 +89,4 @@ BAT/CMD files can execute arbitrary system commands. Successful parsing does not
 
 ## Current Version
 
-`1.2.3`
+`1.3.4`

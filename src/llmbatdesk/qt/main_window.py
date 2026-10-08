@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import importlib
 from pathlib import Path
 
 from PySide6.QtCore import QItemSelection, QModelIndex, QThreadPool, QTimer, Qt, QUrl
@@ -14,14 +15,17 @@ from PySide6.QtWidgets import (
     QStackedWidget, QStyle, QTabWidget, QTableView, QToolBar, QVBoxLayout, QWidget,
 )
 
-from ..domain.models import Backend, ManagedLaunch, RuntimeState, ScriptRecord
+from ..domain.models import (
+    Backend, ManagedLaunch, RuntimeState, ScriptRecord, ScriptRemovalMode,
+)
 from ..parsing.parser import runtime_api_address
 from ..runtime.logging import redact
 from ..runtime.ports import ConflictDecision, PortConflictError
 from ..services import ApplicationService, LaunchBlockedError, LaunchInProgressError
 from .dialogs import (
     AlternatePortDialog, ConflictDialog, DeleteUserDataDialog, MetadataDialog,
-    SettingsDialog, TextDialog, TrustDialog,
+    IgnoredScriptsDialog, ScriptRemovalDialog, SettingsDialog, TextDialog,
+    TrustDialog,
 )
 from .help_content import FAQ, SECURITY_GUIDE, USAGE_GUIDE, about_text
 from .models import LaunchTableModel, runtime_display_state
@@ -49,10 +53,16 @@ class MainWindow(QMainWindow):
         self.selected_record: ScriptRecord | None = None
         self._workers: set[Worker] = set()
         self._start_in_progress = False
+        self._remove_in_progress = False
+        self._script_rescan_busy = False
         self._runtime_refresh_in_progress = False
         self._log_refresh_in_progress = False
         self._api_polling: set[str] = set()
         self.settings_dialog: SettingsDialog | None = None
+        self._model_library_page = None
+        self._model_library_placeholder: QWidget | None = None
+        self._model_library_error: str = ""
+        self._model_library_initializing = False
         self._build_ui()
         self._restore_window_state()
         self._update_empty_details()
@@ -81,8 +91,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("就绪")
         self._build_menus()
 
-        central = QWidget()
-        outer = QVBoxLayout(central)
+        scripts_page = QWidget()
+        outer = QVBoxLayout(scripts_page)
         outer.setContentsMargins(10, 10, 10, 8)
         outer.setSpacing(8)
         header = QHBoxLayout()
@@ -93,13 +103,35 @@ class MainWindow(QMainWindow):
         subtitle.setObjectName("Muted")
         header.addWidget(subtitle)
         header.addStretch()
-        add_root = QPushButton("添加目录")
-        add_root.clicked.connect(self.add_root)
-        header.addWidget(add_root)
-        add_script = QPushButton("添加脚本")
-        add_script.clicked.connect(self.add_script)
-        header.addWidget(add_script)
+        self.add_root_button = QPushButton("添加目录")
+        self.add_root_button.clicked.connect(self.add_root)
+        header.addWidget(self.add_root_button)
+        self.add_script_button = QPushButton("添加脚本")
+        self.add_script_button.clicked.connect(self.add_script)
+        header.addWidget(self.add_script_button)
+        self.script_rescan_button = QPushButton(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload),
+            "重新扫描脚本库",
+        )
+        self.script_rescan_button.setObjectName("ScriptLibraryRescan")
+        self.script_rescan_button.setToolTip(
+            "重新扫描所有已配置脚本目录和单独添加的脚本"
+        )
+        self.script_rescan_button.clicked.connect(self.rescan_async)
+        header.addWidget(self.script_rescan_button)
         outer.addLayout(header)
+        self.setTabOrder(self.add_root_button, self.add_script_button)
+        self.setTabOrder(self.add_script_button, self.script_rescan_button)
+        self.script_rescan_action = QAction("重新扫描脚本库", scripts_page)
+        self.script_rescan_action.setShortcut(QKeySequence("F5"))
+        self.script_rescan_action.setShortcutContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut
+        )
+        self.script_rescan_action.setToolTip(
+            "重新扫描所有已配置脚本目录和单独添加的脚本"
+        )
+        self.script_rescan_action.triggered.connect(self.rescan_async)
+        scripts_page.addAction(self.script_rescan_action)
 
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.main_splitter.setChildrenCollapsible(False)
@@ -115,12 +147,155 @@ class MainWindow(QMainWindow):
         self.main_splitter.setStretchFactor(2, 4)
         self.main_splitter.setSizes([300, 720, 460])
         outer.addWidget(self.main_splitter, 1)
-        self.setCentralWidget(central)
+        self.main_tabs = QTabWidget()
+        self.main_tabs.setObjectName("main_sections")
+        self.main_tabs.addTab(scripts_page, "脚本库")
+        self.main_tabs.currentChanged.connect(self._main_tab_changed)
+        self.setCentralWidget(self.main_tabs)
+        self._sync_model_library_tab()
+
+    def _sync_model_library_tab(self) -> None:
+        enabled = self.service.settings.model_library_enabled
+        existing = next(
+            (
+                index for index in range(self.main_tabs.count())
+                if self.main_tabs.tabText(index) == "模型库"
+            ),
+            -1,
+        )
+        if enabled and existing < 0:
+            self._model_library_error = ""
+            placeholder = QWidget()
+            layout = QVBoxLayout(placeholder)
+            layout.addStretch()
+            title = QLabel("模型库")
+            title.setObjectName("Hero")
+            title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(title)
+            description = QLabel(
+                "首次打开时初始化本地索引。不会自动扫描目录、加载 GGUF 或代理推理请求。"
+            )
+            description.setObjectName("Muted")
+            description.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            description.setWordWrap(True)
+            layout.addWidget(description)
+            layout.addStretch()
+            self._model_library_placeholder = placeholder
+            self.main_tabs.addTab(placeholder, "模型库")
+            return
+        if not enabled and existing >= 0:
+            self.main_tabs.setCurrentIndex(0)
+            if self._model_library_page is not None:
+                self._model_library_page.shutdown()
+                self._model_library_page = None
+            widget = self.main_tabs.widget(existing)
+            self.main_tabs.removeTab(existing)
+            widget.deleteLater()
+            self._model_library_placeholder = None
+            self._model_library_error = ""
+
+    def _main_tab_changed(self, index: int) -> None:
+        self.service.settings.qt_main_tab = index
+        if (
+            index <= 0
+            or self.main_tabs.tabText(index) != "模型库"
+            or self._model_library_page is not None
+            or self._model_library_initializing
+            or self._model_library_error
+        ):
+            return
+        self._initialize_model_library(index)
+
+    def _initialize_model_library(self, index: int) -> None:
+        """Lazy import, database open and cached-data initialization."""
+        placeholder = self.main_tabs.widget(index)
+        self._model_library_initializing = True
+        try:
+            module = importlib.import_module(
+                "llmbatdesk.extensions.model_library.page"
+            )
+            page = module.ModelLibraryPage(
+                self.service.data_dir,
+                self.records,
+                allow_running_scan=(
+                    self.service.settings.model_library_allow_running_scan
+                ),
+                service_active=self._model_operation_active(),
+                column_widths=(
+                    self.service.settings.model_library_column_widths
+                ),
+                parent=self,
+            )
+            page.navigateToScript.connect(self._navigate_from_model_library)
+            page.statusMessage.connect(
+                lambda message: self.statusBar().showMessage(message, 3000)
+            )
+            page.columnWidthsChanged.connect(
+                self._save_model_library_column_widths
+            )
+        except Exception as error:
+            self._model_library_error = str(error)
+            failed = EmptyState(
+                "模型库初始化失败",
+                "此故障不会影响脚本库。\n" + str(error),
+            )
+            self.main_tabs.removeTab(index)
+            self.main_tabs.insertTab(index, failed, "模型库")
+            self.main_tabs.setCurrentIndex(index)
+            placeholder.deleteLater()
+            self._model_library_initializing = False
+            return
+        self._model_library_page = page
+        self.main_tabs.removeTab(index)
+        self.main_tabs.insertTab(index, page, "模型库")
+        self.main_tabs.setCurrentIndex(index)
+        placeholder.deleteLater()
+        self._model_library_initializing = False
+
+    def _save_model_library_column_widths(
+        self, widths: dict[str, list[int]]
+    ) -> None:
+        self.service.settings.model_library_column_widths = widths
+        self.service.settings_store.save(self.service.settings)
+
+    def _navigate_from_model_library(self, script_path: str) -> None:
+        wanted = str(Path(script_path)).casefold()
+        record = next(
+            (
+                item for item in self.records
+                if str(item.parsed.path).casefold() == wanted
+            ),
+            None,
+        )
+        if record is None:
+            self.statusBar().showMessage("引用脚本当前不在脚本库中", 3000)
+            return
+        self.main_tabs.setCurrentIndex(0)
+        self.select_record(record)
+
+    def _model_operation_active(self) -> bool:
+        protected = {
+            RuntimeState.STARTING,
+            RuntimeState.PROCESS_RUNNING_PORT_CLOSED,
+            RuntimeState.PORT_LISTENING_API_NOT_READY,
+            RuntimeState.API_READY,
+            RuntimeState.AUTH_REQUIRED,
+            RuntimeState.STOPPING,
+            RuntimeState.DETACHED_UNVERIFIED,
+        }
+        return any(
+            launch.state in protected for launch in self.service.launches.values()
+        )
+
+    def _shutdown_model_library(self) -> None:
+        if self._model_library_page is not None:
+            self._model_library_page.shutdown()
 
     def _build_menus(self) -> None:
         file_menu = self.menuBar().addMenu("文件")
         file_menu.addAction("添加扫描目录…", self.add_root)
         file_menu.addAction("添加单个脚本…", self.add_script)
+        file_menu.addAction("管理已忽略脚本…", self.show_ignored_scripts)
         file_menu.addSeparator()
         file_menu.addAction("设置…", self.show_settings)
         file_menu.addAction("打开日志目录", self.open_log_directory)
@@ -300,7 +475,7 @@ class MainWindow(QMainWindow):
             ("open_script", "打开脚本", QStyle.StandardPixmap.SP_FileIcon, self.open_script),
             ("open_folder", "打开所在文件夹", QStyle.StandardPixmap.SP_DirOpenIcon, self.open_folder),
             ("open_log", "打开最新日志", QStyle.StandardPixmap.SP_FileDialogDetailedView, self.open_latest_log),
-            ("rescan", "重新扫描", QStyle.StandardPixmap.SP_BrowserReload, self.rescan_async),
+            ("remove_script", "移除脚本", QStyle.StandardPixmap.SP_TrashIcon, self.remove_script_requested),
         )
         self.actions: dict[str, QPushButton] = {}
         for index, (key, label, icon, callback) in enumerate(specifications):
@@ -335,6 +510,8 @@ class MainWindow(QMainWindow):
             "暂无启动历史",
             "失败、停止、过期或被阻止的启动会显示在此处。",
         )
+        self.history_table.setObjectName("LaunchHistoryTable")
+        self.history_table.setAlternatingRowColors(False)
         active_header = self.active_table.horizontalHeader()
         active_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         active_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
@@ -432,7 +609,10 @@ class MainWindow(QMainWindow):
         table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         table.setSortingEnabled(False)
-        table.setAlternatingRowColors(True)
+        # Runtime rows communicate selection and state, not zebra categories.
+        # Leaving this enabled delegates AlternateBase to the platform palette;
+        # on Windows that previously rendered ordinary rows selection-blue.
+        table.setAlternatingRowColors(False)
         table.verticalHeader().setVisible(False)
         table.verticalHeader().setDefaultSectionSize(30)
         table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
@@ -453,6 +633,8 @@ class MainWindow(QMainWindow):
         self.records = records
         self._rebuild_library(records, previous)
         self.library_count.setText(f"{len(records)} 个脚本")
+        if self._model_library_page is not None:
+            self._model_library_page.sync_references(records)
 
     def _filter_library(self, query: str) -> None:
         records = self.service.search(query) if query.strip() else self.records
@@ -728,7 +910,26 @@ class MainWindow(QMainWindow):
         self.actions["open_script"].setEnabled(has_record)
         self.actions["open_folder"].setEnabled(has_record)
         self.actions["open_log"].setEnabled(bool(self._selected_launch()))
-        self.actions["rescan"].setEnabled(True)
+        removal_reason = (
+            self.service.script_removal_block_reason(record)
+            if record else "请先选择脚本"
+        )
+        can_remove = bool(
+            record and not removal_reason and not self._start_in_progress
+            and not self._remove_in_progress
+        )
+        self.actions["remove_script"].setEnabled(can_remove)
+        self.actions["remove_script"].setText(
+            "正在移除……" if self._remove_in_progress else "移除脚本"
+        )
+        self.actions["remove_script"].setToolTip(
+            "从脚本库移除；可选择保留文件或将该 BAT/CMD 移至 Windows 回收站"
+            if can_remove else
+            removal_reason
+            or "当前存在启动操作，完成后才能移除脚本"
+        )
+        self.script_rescan_button.setEnabled(not self._script_rescan_busy)
+        self.script_rescan_action.setEnabled(not self._script_rescan_busy)
         self._set_action_role("start", "start" if runnable else "neutral")
         self._set_action_role("stop", "danger" if can_stop else "neutral")
         self._set_action_role("restart", "warning" if running else "neutral")
@@ -736,6 +937,9 @@ class MainWindow(QMainWindow):
         self._set_action_role(
             "open_log",
             "error_hint" if state == RuntimeState.FAILED else "neutral",
+        )
+        self._set_action_role(
+            "remove_script", "destructive" if can_remove else "neutral"
         )
 
     def _set_action_role(self, key: str, role: str) -> None:
@@ -778,7 +982,12 @@ class MainWindow(QMainWindow):
         return worker
 
     def rescan_async(self) -> None:
-        self.actions["rescan"].setEnabled(False)
+        if self._script_rescan_busy:
+            return
+        self._script_rescan_busy = True
+        self.script_rescan_button.setEnabled(False)
+        self.script_rescan_button.setText("正在重新扫描……")
+        self.script_rescan_action.setEnabled(False)
         self.statusBar().showMessage("正在扫描和解析脚本…")
         preferred = self.selected_record.fingerprint.canonical_path if self.selected_record else ""
         def success(records) -> None:
@@ -788,9 +997,14 @@ class MainWindow(QMainWindow):
             ):
                 self.clear_selection()
             self.statusBar().showMessage(f"扫描完成：{len(records)} 个脚本", 2500)
+        def finished() -> None:
+            self._script_rescan_busy = False
+            self.script_rescan_button.setText("重新扫描脚本库")
+            self.script_rescan_button.setEnabled(True)
+            self.script_rescan_action.setEnabled(True)
         self._run_async(
             self.service.rescan, success,
-            on_finished=lambda: self.actions["rescan"].setEnabled(True),
+            on_finished=finished,
         )
 
     def start_requested(self) -> None:
@@ -1034,6 +1248,10 @@ class MainWindow(QMainWindow):
         self.history_model.set_history(history, self.service.records, self.service.display_name)
         self.active_page.stack.setCurrentIndex(1 if active else 0)  # type: ignore[attr-defined]
         self.history_page.stack.setCurrentIndex(1 if history else 0)  # type: ignore[attr-defined]
+        if self._model_library_page is not None:
+            self._model_library_page.set_model_service_active(
+                self._model_operation_active()
+            )
         self._update_actions()
         if self.selected_record:
             self._render_details(self.selected_record)
@@ -1151,6 +1369,11 @@ class MainWindow(QMainWindow):
             self.service.settings_store.save(dialog.settings)
             apply_theme(QApplication.instance(), dialog.settings.theme)
             self.log_auto_scroll.setChecked(dialog.settings.log_auto_scroll)
+            self._sync_model_library_tab()
+            if self._model_library_page is not None:
+                self._model_library_page.extension_service.allow_running_scan = (
+                    dialog.settings.model_library_allow_running_scan
+                )
             self.cleanup_storage_async()
         else:
             self._apply_terminal_font(*original_terminal)
@@ -1254,6 +1477,85 @@ class MainWindow(QMainWindow):
                 return
             self.bind_records(list(self.service.records.values()))
 
+    def remove_script_requested(self) -> None:
+        record = self.selected_record
+        if record is None or self._remove_in_progress:
+            return
+        reason = self.service.script_removal_block_reason(
+            record, reconcile=True
+        )
+        if reason:
+            QMessageBox.warning(self, "无法移除脚本", reason)
+            self._update_actions()
+            return
+        source = self.service.script_discovery_info(record)
+        dialog = ScriptRemovalDialog(
+            record, self.service.display_name(record), source, self
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted or dialog.choice is None:
+            return
+        if dialog.choice == ScriptRemovalMode.RECYCLE_BIN:
+            answer = QMessageBox.warning(
+                self,
+                "确认移至 Windows 回收站",
+                "脚本文件将被移至 Windows 回收站，可以从回收站恢复。\n\n"
+                f"{record.parsed.path}",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        old_records = list(self.records)
+        old_index = next(
+            (
+                index for index, item in enumerate(old_records)
+                if item.fingerprint.canonical_path
+                == record.fingerprint.canonical_path
+            ),
+            0,
+        )
+        self._remove_in_progress = True
+        self._update_actions()
+
+        def succeeded(result) -> None:
+            remaining = [
+                item for item in old_records
+                if item.fingerprint.canonical_path
+                != record.fingerprint.canonical_path
+                and item.fingerprint.canonical_path in self.service.records
+            ]
+            nearest = (
+                remaining[min(old_index, len(remaining) - 1)]
+                if remaining else None
+            )
+            self.selected_record = None
+            self.service.settings.last_selected_path = (
+                nearest.fingerprint.canonical_path if nearest else ""
+            )
+            self.bind_records(remaining)
+            self.statusBar().showMessage(result.message, 3500)
+
+        def failed(error) -> None:
+            self._show_error(error)
+
+        def finished() -> None:
+            self._remove_in_progress = False
+            self._update_actions()
+
+        self._run_async(
+            lambda: self.service.remove_script(record, dialog.choice),
+            succeeded,
+            on_error=failed,
+            on_finished=finished,
+        )
+
+    def show_ignored_scripts(self) -> None:
+        dialog = IgnoredScriptsDialog(self.service, self)
+        dialog.exec()
+        if dialog.changed:
+            self.rescan_async()
+
     def toggle_theme(self) -> None:
         self.service.settings.theme = (
             "light" if self.service.settings.theme == "dark" else "dark"
@@ -1309,6 +1611,8 @@ class MainWindow(QMainWindow):
             pass
         self.detail_tabs.setCurrentIndex(min(settings.qt_selected_tab, self.detail_tabs.count() - 1))
         self.runtime_tabs.setCurrentIndex(min(settings.qt_runtime_tab, self.runtime_tabs.count() - 1))
+        if self.main_tabs.count() > 1 and settings.qt_main_tab == 1:
+            self.main_tabs.setCurrentIndex(1)
 
     def save_ui_state(self) -> None:
         settings = self.service.settings
@@ -1320,6 +1624,7 @@ class MainWindow(QMainWindow):
         settings.window_maximized = self.isMaximized()
         settings.qt_selected_tab = self.detail_tabs.currentIndex()
         settings.qt_runtime_tab = self.runtime_tabs.currentIndex()
+        settings.qt_main_tab = self.main_tabs.currentIndex()
         settings.qt_column_widths = {
             "active": [self.active_table.columnWidth(i) for i in range(self.active_model.columnCount())],
             "history": [self.history_table.columnWidth(i) for i in range(self.history_model.columnCount())],
@@ -1330,6 +1635,7 @@ class MainWindow(QMainWindow):
         self.save_ui_state()
         active = list(self.service.active_launches().values())
         if not active:
+            self._shutdown_model_library()
             event.accept()
             return
         box = QMessageBox(self)
@@ -1344,7 +1650,9 @@ class MainWindow(QMainWindow):
         elif box.clickedButton() == stop:
             for launch in active:
                 self.service.stop(launch.launch_id)
+            self._shutdown_model_library()
             event.accept()
         else:
             self.service.leave_running()
+            self._shutdown_model_library()
             event.accept()

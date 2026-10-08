@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 from pathlib import Path
 from typing import BinaryIO
@@ -78,6 +79,19 @@ class PsutilProcessInspector:
         except psutil.Error:
             return False
 
+    def request_graceful(self, identity: ProcessIdentity) -> bool:
+        current = self.identity(identity.pid)
+        if not identity_matches(identity, current):
+            return False
+        try:
+            if os.name == "nt":
+                os.kill(identity.pid, signal.CTRL_BREAK_EVENT)
+            else:
+                psutil.Process(identity.pid).terminate()
+            return True
+        except (OSError, psutil.Error):
+            return False
+
     def wait(self, identity: ProcessIdentity, timeout: float) -> bool:
         current = self.identity(identity.pid)
         if not identity_matches(identity, current):
@@ -132,6 +146,17 @@ class ProcessTracker:
             identity_matches(launch.server_identity, child) for child in verified
         ):
             verified.append(launch.server_identity)
+        graceful = getattr(self.inspector, "request_graceful", None)
+        if parent_verified and callable(graceful) and graceful(launch.identity):
+            if self.inspector.wait(launch.identity, timeout):
+                still_owned = any(
+                    identity_matches(
+                        identity, self.inspector.identity(identity.pid)
+                    )
+                    for identity in verified
+                )
+                if not still_owned:
+                    return True
         for identity in reversed(verified):
             self.inspector.terminate(identity, force=False)
         if parent_verified:

@@ -2,7 +2,20 @@
 
 from PyInstaller.utils.hooks import collect_submodules
 
-hiddenimports = collect_submodules("pydantic")
+model_library_hiddenimports = [
+    "llmbatdesk.extensions.model_library",
+    "llmbatdesk.extensions.model_library.models",
+    "llmbatdesk.extensions.model_library.storage",
+    "llmbatdesk.extensions.model_library.gguf_reader",
+    "llmbatdesk.extensions.model_library.quantization",
+    "llmbatdesk.extensions.model_library.presentation",
+    "llmbatdesk.extensions.model_library.scanner",
+    "llmbatdesk.extensions.model_library.references",
+    "llmbatdesk.extensions.model_library.service",
+    "llmbatdesk.extensions.model_library.qt_models",
+    "llmbatdesk.extensions.model_library.page",
+]
+hiddenimports = collect_submodules("pydantic") + model_library_hiddenimports
 qt_excludes = [
     "tkinter",
     "PySide6.Qt3DAnimation", "PySide6.Qt3DCore", "PySide6.Qt3DExtras",

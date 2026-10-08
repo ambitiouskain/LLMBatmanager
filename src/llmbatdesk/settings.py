@@ -5,7 +5,7 @@ import os
 import shutil
 from pathlib import Path
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .domain.models import EditorMode, LaunchConfirmationMode, LaunchMode
 
@@ -37,6 +37,7 @@ class AppSettings(BaseModel):
     qt_splitter_state: str = ""
     qt_selected_tab: int = 0
     qt_runtime_tab: int = 0
+    qt_main_tab: int = 0
     qt_column_widths: dict[str, list[int]] = Field(default_factory=dict)
     last_selected_path: str = ""
     launch_mode: LaunchMode = LaunchMode.BACKGROUND
@@ -50,6 +51,41 @@ class AppSettings(BaseModel):
     terminal_font_family: str = ""
     terminal_font_size: int = 11
     terminal_line_spacing_percent: int = 100
+    model_library_enabled: bool = False
+    model_library_allow_running_scan: bool = False
+    model_library_column_widths: dict[str, list[int]] = Field(
+        default_factory=dict
+    )
+
+    @field_validator(
+        "model_library_enabled", "model_library_allow_running_scan",
+        mode="before",
+    )
+    @classmethod
+    def safe_extension_flags(cls, value):
+        if isinstance(value, bool):
+            return value
+        if value in (0, 1):
+            return bool(value)
+        # A malformed optional extension setting must not invalidate otherwise
+        # usable core settings during an upgrade.
+        return False
+
+    @field_validator("model_library_column_widths", mode="before")
+    @classmethod
+    def safe_model_library_columns(cls, value):
+        if not isinstance(value, dict):
+            return {}
+        result: dict[str, list[int]] = {}
+        for key in ("scan_roots", "models", "references", "components"):
+            widths = value.get(key)
+            if isinstance(widths, list):
+                result[key] = [
+                    item for item in widths
+                    if isinstance(item, int) and not isinstance(item, bool)
+                    and 55 <= item <= 3000
+                ][:16]
+        return result
 
     @model_validator(mode="before")
     @classmethod

@@ -18,7 +18,11 @@ class ScriptScanner:
     def __init__(self, exclusions: Iterable[str] = ()) -> None:
         self.exclusions = tuple(exclusions)
 
-    def scan(self, roots: Iterable[Path], individual: Iterable[Path] = ()) -> list[ScriptRecord]:
+    def scan(
+        self, roots: Iterable[Path], individual: Iterable[Path] = (),
+        ignored_paths: Iterable[str] = (),
+    ) -> list[ScriptRecord]:
+        ignored = {str(value).casefold() for value in ignored_paths}
         paths: dict[str, Path] = {}
         for root in roots:
             if not root.exists() or not root.is_dir():
@@ -26,11 +30,14 @@ class ScriptScanner:
             for path in root.rglob("*"):
                 if path.is_file() and path.suffix.casefold() in {".bat", ".cmd"}:
                     relative = path.relative_to(root)
-                    if not self._excluded(relative):
-                        paths.setdefault(canonical_path(path), path.resolve())
+                    key = canonical_path(path)
+                    if not self._excluded(relative) and key not in ignored:
+                        paths.setdefault(key, path.resolve())
         for path in individual:
             if path.exists() and path.is_file() and path.suffix.casefold() in {".bat", ".cmd"}:
-                paths.setdefault(canonical_path(path), path.resolve())
+                key = canonical_path(path)
+                if key not in ignored:
+                    paths.setdefault(key, path.resolve())
         records: list[ScriptRecord] = []
         for path in sorted(paths.values(), key=lambda item: str(item).casefold()):
             parsed = parse_script(path)

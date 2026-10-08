@@ -7,12 +7,13 @@ from PySide6.QtGui import QFontDatabase
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox, QHBoxLayout,
     QFileDialog, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSpinBox,
-    QSplitter, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
+    QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QTextEdit,
+    QVBoxLayout, QWidget,
 )
 
 from ..domain.models import (
     EditorMode, LaunchConfirmationMode, LaunchMode, LaunchModeOverride, ManagedLaunch, Metadata,
-    PortOccupant, ScriptRecord,
+    PortOccupant, ScriptDiscoveryInfo, ScriptRecord, ScriptRemovalMode,
 )
 from ..runtime.cleanup import StorageStats
 from ..runtime.override import OverrideResult
@@ -46,6 +47,157 @@ class TextDialog(QDialog):
         close_button = buttons.addButton("关闭", QDialogButtonBox.ButtonRole.RejectRole)
         close_button.clicked.connect(self.reject)
         layout.addWidget(buttons)
+
+
+class ScriptRemovalDialog(QDialog):
+    def __init__(
+        self, record: ScriptRecord, display_name: str,
+        source: ScriptDiscoveryInfo, parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.choice: ScriptRemovalMode | None = None
+        self.setWindowTitle("移除脚本")
+        self.setMinimumWidth(560)
+        layout = QVBoxLayout(self)
+        heading = QLabel(f"移除脚本：{display_name}")
+        heading.setObjectName("ErrorBadge")
+        heading.setWordWrap(True)
+        layout.addWidget(heading)
+        path = QLabel(str(record.parsed.path))
+        path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        path.setWordWrap(True)
+        layout.addWidget(path)
+        details = QLabel(
+            f"发现来源：{source.source_label}\n"
+            f"所属扫描目录：{source.owning_root or '否'}\n"
+            f"单独添加：{'是' if source.individually_added else '否'}"
+        )
+        details.setWordWrap(True)
+        layout.addWidget(details)
+        notice = QLabel(
+            "默认操作不会删除脚本文件。启动历史和历史日志会保留，"
+            "脚本专属元数据与信任会被清除。"
+        )
+        notice.setObjectName("WarnBadge")
+        notice.setWordWrap(True)
+        layout.addWidget(notice)
+        buttons = QDialogButtonBox()
+        first_label = (
+            "忽略此脚本，不再通过目录扫描显示"
+            if source.discovered_from_root
+            else "仅从脚本库移除"
+        )
+        self.library_only = buttons.addButton(
+            first_label, QDialogButtonBox.ButtonRole.AcceptRole
+        )
+        self.recycle = buttons.addButton(
+            "将脚本文件移至 Windows 回收站",
+            QDialogButtonBox.ButtonRole.DestructiveRole,
+        )
+        cancel = buttons.addButton(
+            "取消", QDialogButtonBox.ButtonRole.RejectRole
+        )
+        self.library_only.setDefault(True)
+        self.library_only.clicked.connect(
+            lambda: self._choose(ScriptRemovalMode.LIBRARY_ONLY)
+        )
+        self.recycle.clicked.connect(
+            lambda: self._choose(ScriptRemovalMode.RECYCLE_BIN)
+        )
+        cancel.clicked.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _choose(self, choice: ScriptRemovalMode) -> None:
+        self.choice = choice
+        self.accept()
+
+
+class IgnoredScriptsDialog(QDialog):
+    def __init__(self, service, parent=None) -> None:
+        super().__init__(parent)
+        self.service = service
+        self.changed = False
+        self.setWindowTitle("管理已忽略脚本")
+        self.resize(820, 430)
+        self.setMinimumSize(620, 320)
+        layout = QVBoxLayout(self)
+        notice = QLabel(
+            "忽略记录只匹配所属扫描目录内的一个规范脚本路径。取消忽略不会执行脚本。"
+        )
+        notice.setWordWrap(True)
+        layout.addWidget(notice)
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(
+            ("脚本路径", "扫描根目录", "当前状态", "忽略日期")
+        )
+        self.table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self.table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection
+        )
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setAlternatingRowColors(False)
+        self.table.horizontalHeader().setStretchLastSection(False)
+        self.table.setColumnWidth(0, 310)
+        self.table.setColumnWidth(1, 230)
+        self.table.setColumnWidth(2, 90)
+        self.table.setColumnWidth(3, 150)
+        layout.addWidget(self.table, 1)
+        actions = QHBoxLayout()
+        unignore = QPushButton("取消忽略")
+        unignore.clicked.connect(self._unignore)
+        cleanup = QPushButton("清理不存在的记录")
+        cleanup.clicked.connect(self._cleanup)
+        close = QPushButton("关闭")
+        close.clicked.connect(self.accept)
+        actions.addWidget(unignore)
+        actions.addWidget(cleanup)
+        actions.addStretch()
+        actions.addWidget(close)
+        layout.addLayout(actions)
+        self.status = QLabel()
+        self.status.setObjectName("Muted")
+        layout.addWidget(self.status)
+        self._refresh()
+
+    def _refresh(self) -> None:
+        records = self.service.ignored_scripts()
+        self.table.setRowCount(len(records))
+        for row, item in enumerate(records):
+            values = (
+                item.canonical_path,
+                item.root_path,
+                "存在" if Path(item.canonical_path).is_file() else "不存在",
+                item.ignored_at.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+            )
+            for column, value in enumerate(values):
+                cell = QTableWidgetItem(value)
+                if column == 0:
+                    cell.setData(Qt.ItemDataRole.UserRole, item.canonical_path)
+                    cell.setToolTip(item.canonical_path)
+                self.table.setItem(row, column, cell)
+
+    def _selected_path(self) -> str:
+        row = self.table.currentRow()
+        item = self.table.item(row, 0) if row >= 0 else None
+        return str(item.data(Qt.ItemDataRole.UserRole)) if item else ""
+
+    def _unignore(self) -> None:
+        path = self._selected_path()
+        if not path:
+            self.status.setText("请先选择一条忽略记录")
+            return
+        if self.service.cancel_ignore(path):
+            self.changed = True
+            self.status.setText("已取消忽略；不会自动执行脚本")
+            self._refresh()
+
+    def _cleanup(self) -> None:
+        count = self.service.cleanup_missing_ignores()
+        self.changed = self.changed or count > 0
+        self.status.setText(f"已清理 {count} 条不存在的记录")
+        self._refresh()
 
 
 class TrustDialog(QDialog):
@@ -482,6 +634,7 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self._log_page(), "日志")
         self.tabs.addTab(self._storage_page(data_dir), "存储与清理")
         self.tabs.addTab(self._appearance_page(), "外观")
+        self.tabs.addTab(self._extensions_page(), "功能扩展")
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
@@ -717,6 +870,45 @@ class SettingsDialog(QDialog):
         form.addRow("主题", self.theme)
         return page
 
+    def _extensions_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        group = QGroupBox("模型库")
+        form = QFormLayout(group)
+        self.model_library_enabled = QCheckBox("启用模型库")
+        self.model_library_enabled.setChecked(
+            self.settings.model_library_enabled
+        )
+        self.model_library_enabled.setToolTip(
+            "可选的本地 GGUF 索引。默认关闭；不会自动扫描、加载模型或代理推理请求。"
+        )
+        form.addRow(self.model_library_enabled)
+        self.model_library_allow_running_scan = QCheckBox(
+            "允许模型运行时手动扫描"
+        )
+        self.model_library_allow_running_scan.setChecked(
+            self.settings.model_library_allow_running_scan
+        )
+        self.model_library_allow_running_scan.setToolTip(
+            "高级选项。即使启用也只响应手动扫描；磁盘活动可能影响模型加载或推理。"
+        )
+        form.addRow(self.model_library_allow_running_scan)
+        notice = QLabel(
+            "模型库仅扫描用户明确添加的目录。启用后，数据库和扫描器仍会等到首次打开"
+            "“模型库”标签页时才初始化。关闭扩展不会删除索引、标签或备注。"
+        )
+        notice.setWordWrap(True)
+        form.addRow(notice)
+        self.model_library_enabled.toggled.connect(
+            self.model_library_allow_running_scan.setEnabled
+        )
+        self.model_library_allow_running_scan.setEnabled(
+            self.model_library_enabled.isChecked()
+        )
+        layout.addWidget(group)
+        layout.addStretch()
+        return page
+
     def update_storage_stats(self, stats: StorageStats) -> None:
         self.storage_summary.setText(
             f"当前总大小：{_format_size(stats.total_size)}\n"
@@ -756,6 +948,12 @@ class SettingsDialog(QDialog):
             self.terminal_line_spacing.value()
         )
         self.settings.theme = self.theme.currentData()
+        self.settings.model_library_enabled = (
+            self.model_library_enabled.isChecked()
+        )
+        self.settings.model_library_allow_running_scan = (
+            self.model_library_allow_running_scan.isChecked()
+        )
         self.accept()
 
 

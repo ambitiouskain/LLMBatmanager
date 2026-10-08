@@ -43,7 +43,10 @@ def logical_lines(text: str) -> list[LogicalLine]:
             first_line, start_offset = number, offset
         source += raw
         stripped = body.rstrip()
-        continued = stripped.endswith("^") and not stripped.endswith("^^")
+        trailing_carets = len(stripped) - len(stripped.rstrip("^"))
+        # In cmd.exe an odd run has one final continuation caret; the preceding
+        # pairs represent escaped literal carets.
+        continued = trailing_carets % 2 == 1
         if continued:
             buffer += stripped[:-1] + " "
         else:
@@ -65,4 +68,3 @@ def tokenize(command: str) -> tuple[list[str], bool]:
 def unquote(value: str) -> str:
     value = value.strip()
     return value[1:-1].replace('""', '"') if len(value) >= 2 and value[0] == value[-1] == '"' else value
-

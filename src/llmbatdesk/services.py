@@ -5,6 +5,7 @@ import difflib
 import inspect
 import shutil
 import subprocess
+import threading
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -12,19 +13,23 @@ from uuid import uuid4
 from .discovery import ScriptScanner, canonical_path
 from .domain.models import (
     ACTIVE_RUNTIME_STATES, ApiCheckResult, ApiReadinessStatus, LaunchConfirmationMode,
-    LaunchHistoryItem, LaunchMode, LaunchModeOverride, ManagedLaunch, Metadata,
-    OperationEvent, ParsedScript, ParseConfidence, RunnabilityStatus, RuntimeState, ScriptRecord,
+    IgnoredScriptRecord, LaunchHistoryItem, LaunchMode, LaunchModeOverride,
+    ManagedLaunch, Metadata, OperationEvent, ParsedScript, ParseConfidence,
+    RunnabilityStatus, RuntimeState, ScriptDiscoveryInfo, ScriptRecord,
+    ScriptRemovalMode, ScriptRemovalResult,
 )
+from .hashing import fingerprint
 from .runtime.api import HttpxNetworkChecker, poll_readiness
 from .runtime.cleanup import (
     CleanupResult, cleanup_logs, cleanup_temporary_files, delete_user_data_tree,
-    storage_stats,
+    is_path_within, storage_stats,
 )
 from .runtime.logging import OperationLogger
 from .runtime.override import OverrideResult, generate_port_override
 from .runtime.ports import ConflictDecision, PortConflictError, PsutilPortInspector
 from .runtime.lifecycle import RuntimeReconciler
 from .runtime.processes import ProcessTracker, PsutilProcessInspector, SubprocessExecutor
+from .runtime.recycle import QtRecycleBin
 from .runtime.state_machine import transition
 from .runnability import validate_runnability
 from .settings import (
@@ -54,6 +59,7 @@ class ApplicationService:
         process_inspector: object | None = None,
         port_inspector: object | None = None,
         network_checker: object | None = None,
+        recycle_bin: object | None = None,
     ) -> None:
         self.data_dir = data_dir or default_data_dir()
         self.settings_store = settings_store or SettingsStore(self.data_dir)
@@ -66,12 +72,15 @@ class ApplicationService:
         self.port_inspector = port_inspector or PsutilPortInspector()
         self.reconciler = RuntimeReconciler(self.process_inspector, self.port_inspector)
         self.network = network_checker or HttpxNetworkChecker()
+        self.recycle_bin = recycle_bin or QtRecycleBin()
         self.logger = OperationLogger(self.data_dir / "logs")
         self.records: dict[str, ScriptRecord] = {}
         self.launches: dict[str, ManagedLaunch] = {
             item.launch_id: item for item in self.store.load_launches()
         }
         self._launching_scripts: set[str] = set()
+        self._launching_ports: set[int] = set()
+        self._launch_guard = threading.RLock()
         self._reconcile_persisted()
 
     def _reconcile_persisted(self) -> None:
@@ -176,9 +185,14 @@ class ApplicationService:
 
     def rescan(self) -> list[ScriptRecord]:
         scanner = ScriptScanner(self.settings.exclusions)
+        ignored = {
+            item.canonical_path.casefold()
+            for item in self.ignored_scripts()
+        }
         records = scanner.scan(
             (Path(root) for root in self.settings.roots),
             (Path(path) for path in self.settings.individual_scripts),
+            ignored,
         )
         self.records = {record.fingerprint.canonical_path: record for record in records}
         return records
@@ -200,6 +214,196 @@ class ApplicationService:
             self.settings_store.save(self.settings)
         self.records[record.fingerprint.canonical_path] = record
         return record
+
+    def script_discovery_info(
+        self, record: ScriptRecord
+    ) -> ScriptDiscoveryInfo:
+        path = record.parsed.path
+        key = record.fingerprint.canonical_path.casefold()
+        individually_added = any(
+            self._safe_canonical_path(Path(value)) == key
+            for value in self.settings.individual_scripts
+        )
+        roots: list[Path] = []
+        for value in self.settings.roots:
+            try:
+                root = Path(value)
+                if is_path_within(path, root):
+                    roots.append(root.resolve())
+            except (OSError, ValueError):
+                continue
+        owning_root = (
+            str(max(roots, key=lambda item: len(item.parts)))
+            if roots else None
+        )
+        return ScriptDiscoveryInfo(
+            canonical_path=record.fingerprint.canonical_path,
+            owning_root=owning_root,
+            individually_added=individually_added,
+        )
+
+    def script_removal_block_reason(
+        self, record: ScriptRecord, *, reconcile: bool = False
+    ) -> str | None:
+        reason = self._current_script_removal_block_reason(record)
+        if reason or not reconcile:
+            return reason
+        self.reconcile_runtimes()
+        return self._current_script_removal_block_reason(record)
+
+    def _current_script_removal_block_reason(
+        self, record: ScriptRecord
+    ) -> str | None:
+        key = record.fingerprint.canonical_path.casefold()
+        with self._launch_guard:
+            if key in self._launching_scripts:
+                return "该脚本仍有关联服务或启动任务，请先停止后再移除。"
+            for launch in self.launches.values():
+                if self._safe_canonical_path(Path(launch.script_path)) != key:
+                    continue
+                if launch.state not in {
+                    RuntimeState.NOT_RUNNING,
+                    RuntimeState.STOPPED,
+                    RuntimeState.FAILED,
+                    RuntimeState.STALE_RECORD,
+                }:
+                    return "该脚本仍有关联服务或启动任务，请先停止后再移除。"
+        return None
+
+    def ignored_scripts(self) -> list[IgnoredScriptRecord]:
+        configured_roots = {
+            self._safe_canonical_path(Path(value)): Path(value)
+            for value in self.settings.roots
+        }
+        result: list[IgnoredScriptRecord] = []
+        for item in self.store.ignored_scripts():
+            candidate = Path(item.canonical_path)
+            root = Path(item.root_path)
+            root_key = self._safe_canonical_path(root)
+            if (
+                not item.canonical_path
+                or not item.root_path
+                or not candidate.is_absolute()
+                or candidate.suffix.casefold() not in {".bat", ".cmd"}
+                or any(marker in item.canonical_path for marker in ("*", "?"))
+                or root_key not in configured_roots
+                or not is_path_within(candidate, configured_roots[root_key])
+                or self._safe_canonical_path(candidate)
+                != item.canonical_path.casefold()
+            ):
+                continue
+            result.append(item)
+        return result
+
+    def cancel_ignore(self, canonical_script_path: str) -> bool:
+        return self.store.remove_ignored_script(canonical_script_path)
+
+    def cleanup_missing_ignores(self) -> int:
+        missing = [
+            item.canonical_path for item in self.ignored_scripts()
+            if not Path(item.canonical_path).exists()
+        ]
+        return self.store.clear_missing_ignored_scripts(missing)
+
+    def remove_script(
+        self, record: ScriptRecord, mode: ScriptRemovalMode
+    ) -> ScriptRemovalResult:
+        reason = self.script_removal_block_reason(record, reconcile=True)
+        if reason:
+            raise LaunchInProgressError(reason)
+        source = self.script_discovery_info(record)
+        if not source.individually_added and not source.discovered_from_root:
+            raise ValueError("无法确认该脚本的发现来源，已拒绝移除。")
+
+        path = record.parsed.path
+        recycled = False
+        if mode == ScriptRemovalMode.RECYCLE_BIN:
+            self._validate_recycle_candidate(record)
+            # Recheck ownership immediately before invoking the recycle-bin API.
+            reason = self.script_removal_block_reason(record, reconcile=True)
+            if reason:
+                raise LaunchInProgressError(reason)
+            self.recycle_bin.move_to_trash(path)
+            recycled = True
+
+        ignored = False
+        if mode == ScriptRemovalMode.LIBRARY_ONLY and source.owning_root:
+            self.store.add_ignored_script(
+                str(path.resolve()), source.owning_root
+            )
+            ignored = True
+        else:
+            self.store.remove_ignored_script(
+                record.fingerprint.canonical_path
+            )
+
+        old_individuals = list(self.settings.individual_scripts)
+        self.settings.individual_scripts = [
+            value for value in self.settings.individual_scripts
+            if self._safe_canonical_path(Path(value))
+            != record.fingerprint.canonical_path.casefold()
+        ]
+        if self.settings.individual_scripts != old_individuals:
+            self.settings_store.save(self.settings)
+
+        self.store.remove_script_personal_data(
+            record.fingerprint.canonical_path,
+            record.fingerprint.sha256,
+        )
+        self.records.pop(record.fingerprint.canonical_path, None)
+        self.store.add_event(OperationEvent(kind="script_removed", data={
+            "script_path": str(path),
+            "mode": mode.value,
+            "ignored": ignored,
+            "recycled": recycled,
+        }))
+        message = (
+            "脚本文件已移至 Windows 回收站"
+            if recycled else
+            "脚本已忽略，后续目录扫描不会显示"
+            if ignored else
+            "脚本已从脚本库移除，原文件保持不变"
+        )
+        return ScriptRemovalResult(
+            canonical_path=record.fingerprint.canonical_path,
+            mode=mode, ignored=ignored, recycled=recycled,
+            message=message,
+        )
+
+    def _validate_recycle_candidate(self, record: ScriptRecord) -> None:
+        path = record.parsed.path
+        if path.suffix.casefold() not in {".bat", ".cmd"}:
+            raise ValueError("仅支持将现有 .bat 或 .cmd 文件移至回收站。")
+        if not path.exists() or not path.is_file():
+            raise FileNotFoundError("脚本文件不存在或不是普通文件。")
+        if self._is_reparse_point(path):
+            raise ValueError("拒绝移动符号链接、联接点、挂载点或重解析点。")
+        current = fingerprint(path)
+        expected = record.fingerprint
+        if (
+            current.canonical_path != expected.canonical_path
+            or current.size != expected.size
+            or current.mtime_ns != expected.mtime_ns
+            or current.sha256 != expected.sha256
+        ):
+            raise RuntimeError("脚本内容或文件身份已变化，请重新扫描后再操作。")
+
+    @staticmethod
+    def _is_reparse_point(path: Path) -> bool:
+        try:
+            stat_result = path.lstat()
+        except OSError:
+            return True
+        return path.is_symlink() or bool(
+            getattr(stat_result, "st_file_attributes", 0) & 0x400
+        )
+
+    @staticmethod
+    def _safe_canonical_path(path: Path) -> str:
+        try:
+            return canonical_path(path)
+        except (OSError, ValueError):
+            return ""
 
     def metadata(self, record: ScriptRecord) -> Metadata:
         return self.store.get_metadata(record.fingerprint.canonical_path)
@@ -286,10 +490,13 @@ class ApplicationService:
         return occupant
 
     def prepare_override(self, record: ScriptRecord, new_port: int) -> OverrideResult:
+        temporary_dir = self.data_dir / "temporary"
+        if not is_path_within(temporary_dir, self.data_dir):
+            raise PermissionError("临时脚本目录解析到应用数据目录之外")
         try:
             result = generate_port_override(
                 record.parsed, Path(record.parsed.path).read_bytes(), new_port,
-                self.data_dir / "temporary",
+                temporary_dir,
             )
         except Exception as error:
             self.store.add_event(OperationEvent(kind="port_override_refused", data={
@@ -340,22 +547,49 @@ class ApplicationService:
                 "reason": reason,
             }))
             raise LaunchBlockedError(reason)
-        script_key = record.fingerprint.canonical_path
-        if script_key in self._launching_scripts or any(
-            item.script_path == str(record.parsed.path) and item.state == RuntimeState.STARTING
-            for item in self.launches.values()
-        ):
-            self.store.add_event(OperationEvent(kind="launch_deduplicated", data={
-                "script_path": str(record.parsed.path),
-            }))
-            raise LaunchInProgressError("该脚本已有启动请求正在等待验证")
         script = override.path if override else record.parsed.path
         actual_port = override.new_port if override else record.parsed.configured_port
-        occupant = self.inspect_port(record.parsed, actual_port)
-        if occupant:
-            raise PortConflictError(occupant)
-        self._launching_scripts.add(script_key)
+        script_key = record.fingerprint.canonical_path
+        with self._launch_guard:
+            script_pending = (
+                script_key in self._launching_scripts
+                or any(
+                    item.script_path == str(record.parsed.path)
+                    and item.state == RuntimeState.STARTING
+                    for item in self.launches.values()
+                )
+            )
+            port_pending = (
+                actual_port is not None
+                and (
+                    actual_port in self._launching_ports
+                    or any(
+                        item.actual_port == actual_port
+                        and item.state not in {
+                            RuntimeState.STOPPED,
+                            RuntimeState.FAILED,
+                            RuntimeState.STALE_RECORD,
+                        }
+                        for item in self.launches.values()
+                    )
+                )
+            )
+            if script_pending or port_pending:
+                self.store.add_event(OperationEvent(kind="launch_deduplicated", data={
+                    "script_path": str(record.parsed.path),
+                    "actual_port": actual_port,
+                    "reason": "script_pending" if script_pending else "port_pending",
+                }))
+                raise LaunchInProgressError(
+                    "该脚本或目标端口已有启动请求正在等待验证"
+                )
+            self._launching_scripts.add(script_key)
+            if actual_port is not None:
+                self._launching_ports.add(actual_port)
         try:
+            occupant = self.inspect_port(record.parsed, actual_port)
+            if occupant:
+                raise PortConflictError(occupant)
             launch_mode = self.effective_launch_mode(record)
             log_path = self.logger.create({
                 "原始脚本": record.parsed.path,
@@ -386,6 +620,10 @@ class ApplicationService:
             finally:
                 if output is not None:
                     output.close()
+        except PortConflictError:
+            # A pre-launch conflict is an expected decision workflow, not a
+            # failed launch attempt.
+            raise
         except Exception as error:
             self.store.add_event(OperationEvent(kind="launch_failed_before_tracking", data={
                 "script_path": str(record.parsed.path),
@@ -397,7 +635,10 @@ class ApplicationService:
             }))
             raise
         finally:
-            self._launching_scripts.discard(script_key)
+            with self._launch_guard:
+                self._launching_scripts.discard(script_key)
+                if actual_port is not None:
+                    self._launching_ports.discard(actual_port)
         identity.port = actual_port
         launch_id = uuid4().hex
         launch = ManagedLaunch(
@@ -427,6 +668,10 @@ class ApplicationService:
         self.reconciler.reconcile(launch)
         if launch_id not in self.active_launches():
             return False
+        # Invalidate any readiness request already running in a worker thread.
+        launch.api_check_generation += 1
+        launch.api_ready = False
+        launch.api_status = ApiReadinessStatus.NOT_CHECKED
         launch.state = transition(launch.state, RuntimeState.STOPPING)
         stopped = self.tracker.stop(launch, self.settings.stop_timeout_seconds)
         launch.user_stopped = True
@@ -455,6 +700,20 @@ class ApplicationService:
     def apply_api_result(
         self, launch: ManagedLaunch, result: ApiCheckResult, generation: int
     ) -> bool:
+        if launch.state in {
+            RuntimeState.STOPPING,
+            RuntimeState.STOPPED,
+            RuntimeState.FAILED,
+            RuntimeState.DETACHED_UNVERIFIED,
+            RuntimeState.STALE_RECORD,
+        }:
+            self.store.add_event(OperationEvent(kind="api_stale_result_ignored", data={
+                "launch_id": launch.launch_id,
+                "generation": generation,
+                "current_generation": launch.api_check_generation,
+                "reason": f"terminal_state:{launch.state.name}",
+            }))
+            return False
         if generation != launch.api_check_generation:
             self.store.add_event(OperationEvent(kind="api_stale_result_ignored", data={
                 "launch_id": launch.launch_id,
@@ -482,6 +741,7 @@ class ApplicationService:
             "process_exited": ApiReadinessStatus.PROCESS_EXITED,
             "request_error": ApiReadinessStatus.ERROR,
             "http_error": ApiReadinessStatus.ERROR,
+            "response_too_large": ApiReadinessStatus.ERROR,
         }
         launch.api_status = status_map.get(result.error_kind, ApiReadinessStatus.ERROR)
         launch.api_ready = result.ready
@@ -564,7 +824,9 @@ class ApplicationService:
         if launch.temporary_script_path and launch.state in {
             RuntimeState.STOPPED, RuntimeState.FAILED
         }:
-            Path(launch.temporary_script_path).unlink(missing_ok=True)
+            temporary = self._safe_temporary_path(launch.temporary_script_path)
+            if temporary is not None and not temporary.is_symlink():
+                temporary.unlink(missing_ok=True)
 
     def storage_stats(self):
         return storage_stats(
@@ -621,7 +883,8 @@ class ApplicationService:
         defaults = AppSettings()
         for field in (
             "qt_geometry", "qt_window_state", "qt_splitter_state",
-            "qt_selected_tab", "qt_runtime_tab", "qt_column_widths",
+            "qt_selected_tab", "qt_runtime_tab", "qt_main_tab",
+            "qt_column_widths", "model_library_column_widths",
             "last_selected_path",
         ):
             setattr(self.settings, field, getattr(defaults, field))
@@ -667,7 +930,9 @@ class ApplicationService:
         if destination.exists():
             raise FileExistsError(f"不会覆盖已有文件：{destination}")
         original = Path(launch.script_path)
-        temporary = Path(launch.temporary_script_path)
+        temporary = self._safe_temporary_path(launch.temporary_script_path)
+        if temporary is None:
+            raise PermissionError("临时脚本路径位于应用数据目录之外")
         from .parsing.tokenizer import decode_batch
         before, _ = decode_batch(original.read_bytes())
         after, encoding = decode_batch(temporary.read_bytes())
@@ -680,6 +945,13 @@ class ApplicationService:
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(managed.encode(encoding))
         return diff
+
+    def _safe_temporary_path(self, value: str) -> Path | None:
+        temporary_root = self.data_dir / "temporary"
+        if not is_path_within(temporary_root, self.data_dir):
+            return None
+        candidate = Path(value)
+        return candidate if is_path_within(candidate, temporary_root) else None
 
     def open_path(self, path: Path) -> None:
         if os.name != "nt":

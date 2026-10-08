@@ -28,6 +28,10 @@ def _same_executable(actual: str | None, expected: str | None) -> bool:
             return True
     except OSError:
         pass
+    # When both sides provide explicit paths, a basename match is insufficient:
+    # it could attach an unrelated binary with the same common filename.
+    if actual_path.is_absolute() and expected_path.is_absolute():
+        return False
     return actual_path.name.casefold() == expected_path.name.casefold()
 
 

@@ -83,6 +83,45 @@ class EditorMode(StrEnum):
     CUSTOM = "custom"
 
 
+class ScriptRemovalMode(StrEnum):
+    LIBRARY_ONLY = "library_only"
+    RECYCLE_BIN = "recycle_bin"
+
+
+class IgnoredScriptRecord(BaseModel):
+    canonical_path: str
+    root_path: str
+    ignored_at: datetime = Field(default_factory=datetime.now)
+
+
+class ScriptDiscoveryInfo(BaseModel):
+    canonical_path: str
+    owning_root: str | None = None
+    individually_added: bool = False
+
+    @property
+    def discovered_from_root(self) -> bool:
+        return self.owning_root is not None
+
+    @property
+    def source_label(self) -> str:
+        if self.discovered_from_root and self.individually_added:
+            return "扫描目录及单独添加"
+        if self.discovered_from_root:
+            return "配置的扫描目录"
+        if self.individually_added:
+            return "单独添加"
+        return "未知来源"
+
+
+class ScriptRemovalResult(BaseModel):
+    canonical_path: str
+    mode: ScriptRemovalMode
+    ignored: bool = False
+    recycled: bool = False
+    message: str
+
+
 ACTIVE_RUNTIME_STATES = {
     RuntimeState.PROCESS_RUNNING_PORT_CLOSED,
     RuntimeState.PORT_LISTENING_API_NOT_READY,

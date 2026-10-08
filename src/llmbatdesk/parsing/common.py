@@ -7,6 +7,25 @@ from .tokenizer import LogicalLine, tokenize
 from .variables import expand_static
 
 SET_RE = re.compile(r'^\s*@?set\s+(?:"([^"=]+)=(.*)"|([^=\s]+)=(.*))\s*$', re.IGNORECASE)
+DELAYED_VARIABLE_RE = re.compile(r"![A-Za-z_][A-Za-z0-9_]*!")
+
+
+def _unquoted_metacharacters(value: str) -> set[str]:
+    """Return active batch metacharacters, ignoring quotes and caret escapes."""
+    found: set[str] = set()
+    quoted = False
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character == "^" and index + 1 < len(value):
+            index += 2
+            continue
+        if character == '"':
+            quoted = not quoted
+        elif not quoted and character in "&|()":
+            found.add(character)
+        index += 1
+    return found
 
 
 @dataclass
@@ -26,7 +45,7 @@ def analyze_lines(lines: list[LogicalLine]) -> StaticContext:
     for line in lines:
         stripped = line.text.strip()
         low = stripped.casefold()
-        if "!" in stripped:
+        if DELAYED_VARIABLE_RE.search(stripped):
             context.dynamic_reasons.append(f"第 {line.line_number} 行可能使用延迟变量展开")
         if not stripped or low.startswith(("rem ", "::", "@echo", "echo ")):
             continue
@@ -48,9 +67,31 @@ def analyze_lines(lines: list[LogicalLine]) -> StaticContext:
                 context.dynamic_reasons.append(
                     f"第 {line.line_number} 行变量 {name} 依赖未知变量：{', '.join(unresolved)}"
                 )
+            if name in {"PORT", "LLAMA_PORT"} and name in context.safe_port_assignments:
+                context.dynamic_reasons.append(
+                    f"第 {line.line_number} 行重复设置端口变量 {name}"
+                )
             if name in {"PORT", "LLAMA_PORT"} and expanded.isdigit() and not unresolved:
                 context.safe_port_assignments[name] = (line, expanded)
             continue
+        metacharacters = _unquoted_metacharacters(stripped)
+        if metacharacters:
+            context.dynamic_reasons.append(
+                f"第 {line.line_number} 行包含批处理控制运算符："
+                + " ".join(sorted(metacharacters))
+            )
+        command_text = stripped.lstrip("@").lstrip()
+        if re.match(r"(?i)^(?:if|for|else)\b", command_text):
+            context.dynamic_reasons.append(
+                f"第 {line.line_number} 行包含条件或循环分支"
+            )
+        if re.match(
+            r"(?i)^(?:cmd(?:\.exe)?\s+/(?:c|k)\b|powershell(?:\.exe)?\b|pwsh(?:\.exe)?\b)",
+            command_text,
+        ):
+            context.dynamic_reasons.append(
+                f"第 {line.line_number} 行通过动态命令包装器启动"
+            )
         if low.startswith("call ") or low.startswith("@call "):
             context.uses_call = True
             context.dynamic_reasons.append(f"第 {line.line_number} 行包含外部 CALL")

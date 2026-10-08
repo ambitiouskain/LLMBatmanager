@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 from dataclasses import dataclass
@@ -24,10 +25,40 @@ class CleanupResult:
     freed_bytes: int = 0
 
 
+def _is_reparse_point(path: Path) -> bool:
+    try:
+        stat = path.lstat()
+    except OSError:
+        return True
+    attributes = getattr(stat, "st_file_attributes", 0)
+    return path.is_symlink() or bool(attributes & 0x400)
+
+
+def is_path_within(path: Path, root: Path) -> bool:
+    try:
+        resolved_root = root.resolve()
+        resolved_path = path.resolve()
+    except OSError:
+        return False
+    return resolved_path != resolved_root and resolved_root in resolved_path.parents
+
+
 def _files(root: Path) -> list[Path]:
-    if not root.exists():
+    if not root.exists() or _is_reparse_point(root):
         return []
-    return [path for path in root.rglob("*") if path.is_file()]
+    result: list[Path] = []
+    for directory, names, filenames in os.walk(root, followlinks=False):
+        directory_path = Path(directory)
+        names[:] = [
+            name for name in names
+            if not _is_reparse_point(directory_path / name)
+        ]
+        result.extend(
+            path
+            for name in filenames
+            if (path := directory_path / name).is_file()
+        )
+    return result
 
 
 def directory_size(root: Path) -> int:
@@ -69,6 +100,8 @@ def cleanup_logs(
     protected_size = 0
     for path in _files(log_dir):
         try:
+            if _is_reparse_point(path) or not is_path_within(path, log_dir):
+                continue
             stat = path.stat()
             if path.resolve() in protected:
                 protected_count += 1
@@ -123,6 +156,8 @@ def cleanup_temporary_files(
     deleted = freed = 0
     for path in _files(temporary_dir):
         try:
+            if _is_reparse_point(path) or not is_path_within(path, temporary_dir):
+                continue
             if path.resolve() in protected:
                 continue
             size = path.stat().st_size
@@ -135,6 +170,8 @@ def cleanup_temporary_files(
 
 
 def delete_user_data_tree(data_dir: Path) -> None:
+    if data_dir.exists() and _is_reparse_point(data_dir):
+        raise ValueError("拒绝删除符号链接、联接或其他重解析点数据目录")
     resolved = data_dir.resolve()
     executable = Path(sys.executable).resolve()
     if resolved == executable or resolved in executable.parents:

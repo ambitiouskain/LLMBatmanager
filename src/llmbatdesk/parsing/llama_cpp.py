@@ -8,7 +8,7 @@ from .common import StaticContext
 
 VALUE_OPTIONS = {
     "--model": "model_path", "-m": "model_path",
-    "--host": "bind_host", "--port": "configured_port",
+    "--host": "bind_host", "--port": "configured_port", "-p": "configured_port",
     "--ctx-size": "context_size", "-c": "context_size",
     "--n-gpu-layers": "gpu_layers", "--gpu-layers": "gpu_layers",
     "-ngl": "gpu_layers",
@@ -20,7 +20,12 @@ VALUE_OPTIONS = {
     "--cache-type-v": "cache_type_v", "--temp": "temperature",
     "--top-p": "top_p", "--min-p": "min_p", "--repeat-penalty": "repeat_penalty",
     "--seed": "seed", "--chat-template": "chat_template",
-    "--api-key": "api_key", "--draft-model": "draft_model",
+    "--api-key": "api_key",
+    "--draft-model": "draft_model_path", "--draft": "draft_model_path",
+    "--mmproj": "mmproj_path", "--mmproj-file": "mmproj_path",
+    "--lora": "adapter_path", "--lora-file": "adapter_path",
+    "--control-vector": "control_path",
+    "--control-vector-file": "control_path",
 }
 FLAG_OPTIONS = {
     "--jinja": "jinja", "--no-context-shift": "context_shift_disabled",
@@ -43,10 +48,14 @@ def _is_llama(tokens: list[str]) -> bool:
 
 
 def parse_llama(result: ParsedScript, context: StaticContext) -> bool:
-    candidate = next(((line, tokens) for line, tokens in context.commands if _is_llama(tokens)), None)
-    if not candidate:
+    candidates = [
+        (line, tokens) for line, tokens in context.commands if _is_llama(tokens)
+    ]
+    if not candidates:
         return False
-    line, tokens = candidate
+    if len(candidates) > 1:
+        result.dynamic_reasons.append("脚本包含多个 llama.cpp 服务器命令")
+    line, tokens = candidates[0]
     result.backend = Backend.LLAMA_CPP
     exe_index = next(
         (i for i, token in enumerate(tokens) if Path(token).name.casefold() in
@@ -55,6 +64,14 @@ def parse_llama(result: ParsedScript, context: StaticContext) -> bool:
     result.executable = tokens[exe_index]
     i = exe_index + 1
     known_indexes: set[int] = {exe_index}
+    port_argument_count = sum(
+        1
+        for token in tokens[exe_index + 1:]
+        if token.partition("=")[0].casefold() in {"--port", "-p"}
+    )
+    if port_argument_count > 1:
+        result.dynamic_reasons.append("llama.cpp 命令包含重复或冲突的端口参数")
+        result.warnings.append("检测到重复或冲突的端口参数，已禁用临时覆盖")
     while i < len(tokens):
         raw = tokens[i]
         key, equal, inline = raw.partition("=")

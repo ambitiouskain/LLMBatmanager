@@ -7,7 +7,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 
-from .domain.models import LaunchModeOverride, ManagedLaunch, Metadata, OperationEvent
+from .domain.models import (
+    IgnoredScriptRecord, LaunchModeOverride, ManagedLaunch, Metadata,
+    OperationEvent,
+)
 from .settings import default_data_dir
 
 
@@ -15,12 +18,32 @@ class MetadataStore:
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or default_data_dir() / "llmbatdesk.db"
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._initialize()
+        try:
+            self._initialize()
+        except sqlite3.DatabaseError as error:
+            message = str(error).casefold()
+            corruption = any(
+                marker in message
+                for marker in ("not a database", "malformed", "file is encrypted")
+            )
+            if not corruption or not self.path.exists():
+                raise
+            suffix = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            quarantine = self.path.with_name(
+                f"{self.path.name}.corrupt-{suffix}"
+            )
+            self.path.replace(quarantine)
+            for companion_suffix in ("-wal", "-shm"):
+                companion = Path(str(self.path) + companion_suffix)
+                if companion.exists():
+                    companion.replace(Path(str(quarantine) + companion_suffix))
+            self._initialize()
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path)
+        connection = sqlite3.connect(self.path, timeout=10.0)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout=10000")
         try:
             yield connection
             connection.commit()
@@ -61,6 +84,11 @@ class MetadataStore:
                     launch_id TEXT PRIMARY KEY,
                     data_json TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS ignored_scripts (
+                    canonical_path TEXT PRIMARY KEY COLLATE NOCASE,
+                    root_path TEXT NOT NULL,
+                    ignored_at TEXT NOT NULL
+                );
                 """
             )
             metadata_columns = {
@@ -90,17 +118,24 @@ class MetadataStore:
             ).fetchone()
         if not row:
             return Metadata(canonical_path=canonical_path)
-        return Metadata(
-            canonical_path=row["canonical_path"], display_name=row["display_name"],
-            favorite=bool(row["favorite"]), tags=json.loads(row["tags_json"]),
-            games=json.loads(row["games_json"]), category=row["category"],
-            purpose=row["purpose"], strengths=row["strengths"], weaknesses=row["weaknesses"],
-            notes=row["notes"], sort_order=row["sort_order"],
-            last_run_at=datetime.fromisoformat(row["last_run_at"]) if row["last_run_at"] else None,
-            launch_mode_override=LaunchModeOverride(
-                row["launch_mode_override"] if "launch_mode_override" in row.keys() else "global"
-            ),
-        )
+        try:
+            return Metadata(
+                canonical_path=row["canonical_path"], display_name=row["display_name"],
+                favorite=bool(row["favorite"]), tags=json.loads(row["tags_json"]),
+                games=json.loads(row["games_json"]), category=row["category"],
+                purpose=row["purpose"], strengths=row["strengths"], weaknesses=row["weaknesses"],
+                notes=row["notes"], sort_order=row["sort_order"],
+                last_run_at=(
+                    datetime.fromisoformat(row["last_run_at"])
+                    if row["last_run_at"] else None
+                ),
+                launch_mode_override=LaunchModeOverride(
+                    row["launch_mode_override"]
+                    if "launch_mode_override" in row.keys() else "global"
+                ),
+            )
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return Metadata(canonical_path=canonical_path)
 
     def save_metadata(self, metadata: Metadata) -> None:
         values = metadata.model_dump(mode="json")
@@ -139,6 +174,86 @@ class MetadataStore:
                 "UPDATE metadata SET canonical_path=? WHERE canonical_path=?", (new_path, old_path)
             )
             return cursor.rowcount == 1
+
+    def remove_script_personal_data(
+        self, canonical_path: str, content_hash: str
+    ) -> None:
+        """Remove current-script metadata/trust without touching history."""
+        with self.connection() as db:
+            db.execute(
+                "DELETE FROM metadata WHERE canonical_path=? COLLATE NOCASE",
+                (canonical_path,),
+            )
+            db.execute(
+                "DELETE FROM trust WHERE content_hash=? OR "
+                "canonical_path=? COLLATE NOCASE",
+                (content_hash, canonical_path),
+            )
+
+    def add_ignored_script(
+        self, canonical_path: str, root_path: str
+    ) -> IgnoredScriptRecord:
+        item = IgnoredScriptRecord(
+            canonical_path=canonical_path,
+            root_path=root_path,
+            ignored_at=datetime.now(),
+        )
+        with self.connection() as db:
+            db.execute(
+                """
+                INSERT INTO ignored_scripts(
+                    canonical_path, root_path, ignored_at
+                ) VALUES(?,?,?)
+                ON CONFLICT(canonical_path) DO UPDATE SET
+                    root_path=excluded.root_path,
+                    ignored_at=excluded.ignored_at
+                """,
+                (
+                    item.canonical_path, item.root_path,
+                    item.ignored_at.isoformat(),
+                ),
+            )
+        return item
+
+    def ignored_scripts(self) -> list[IgnoredScriptRecord]:
+        with self.connection() as db:
+            rows = db.execute(
+                "SELECT canonical_path,root_path,ignored_at "
+                "FROM ignored_scripts ORDER BY ignored_at DESC"
+            ).fetchall()
+        result: list[IgnoredScriptRecord] = []
+        for row in rows:
+            try:
+                result.append(IgnoredScriptRecord(
+                    canonical_path=row["canonical_path"],
+                    root_path=row["root_path"],
+                    ignored_at=datetime.fromisoformat(row["ignored_at"]),
+                ))
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    def remove_ignored_script(self, canonical_path: str) -> bool:
+        with self.connection() as db:
+            cursor = db.execute(
+                "DELETE FROM ignored_scripts "
+                "WHERE canonical_path=? COLLATE NOCASE",
+                (canonical_path,),
+            )
+            return cursor.rowcount > 0
+
+    def clear_missing_ignored_scripts(self, paths: list[str]) -> int:
+        if not paths:
+            return 0
+        with self.connection() as db:
+            count = 0
+            for path in paths:
+                count += db.execute(
+                    "DELETE FROM ignored_scripts "
+                    "WHERE canonical_path=? COLLATE NOCASE",
+                    (path,),
+                ).rowcount
+            return count
 
     def trust(
         self, content_hash: str, working_directory: str = "", canonical_path: str = ""
@@ -208,14 +323,17 @@ class MetadataStore:
                     "SELECT kind,timestamp,data_json FROM history ORDER BY id DESC LIMIT ?",
                     (limit,),
                 ).fetchall()
-        return [
-            OperationEvent(
-                kind=row["kind"],
-                timestamp=datetime.fromisoformat(row["timestamp"]),
-                data=json.loads(row["data_json"]),
-            )
-            for row in rows
-        ]
+        result: list[OperationEvent] = []
+        for row in rows:
+            try:
+                result.append(OperationEvent(
+                    kind=row["kind"],
+                    timestamp=datetime.fromisoformat(row["timestamp"]),
+                    data=json.loads(row["data_json"]),
+                ))
+            except (ValueError, TypeError, json.JSONDecodeError):
+                continue
+        return result
 
     def save_launch(self, launch: ManagedLaunch) -> None:
         with self.connection() as db:
@@ -227,7 +345,13 @@ class MetadataStore:
     def load_launches(self) -> list[ManagedLaunch]:
         with self.connection() as db:
             rows = db.execute("SELECT data_json FROM managed_launch").fetchall()
-        return [ManagedLaunch.model_validate_json(row["data_json"]) for row in rows]
+        launches: list[ManagedLaunch] = []
+        for row in rows:
+            try:
+                launches.append(ManagedLaunch.model_validate_json(row["data_json"]))
+            except (ValueError, TypeError):
+                continue
+        return launches
 
     def remove_launch(self, launch_id: str) -> None:
         with self.connection() as db:

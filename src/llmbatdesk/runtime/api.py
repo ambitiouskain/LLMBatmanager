@@ -10,8 +10,16 @@ from ..domain.models import ApiCheckResult, Backend, RuntimeState
 
 
 class HttpxNetworkChecker:
-    def __init__(self, client: httpx.Client | None = None, timeout: float = 2.0) -> None:
+    def __init__(
+        self,
+        client: httpx.Client | None = None,
+        timeout: float = 2.0,
+        max_response_bytes: int = 1_048_576,
+        max_reported_models: int = 100,
+    ) -> None:
         self.client = client or httpx.Client(timeout=timeout, trust_env=False)
+        self.max_response_bytes = max(1024, max_response_bytes)
+        self.max_reported_models = max(1, max_reported_models)
 
     def check(
         self, base_address: str, backend: Backend, api_key: str | None = None
@@ -62,28 +70,52 @@ class HttpxNetworkChecker:
                 )
                 continue
             if response.is_success:
+                if endpoint == "/health":
+                    return ApiCheckResult(
+                        ready=True,
+                        state=RuntimeState.API_READY,
+                        status_code=response.status_code,
+                        detail="兼容健康检查已就绪",
+                        checked_url=url,
+                    )
+                if len(response.content) > self.max_response_bytes:
+                    return ApiCheckResult(
+                        ready=False,
+                        state=RuntimeState.PORT_LISTENING_API_NOT_READY,
+                        status_code=response.status_code,
+                        detail="API 响应过大，已拒绝解析",
+                        checked_url=url,
+                        error_kind="response_too_large",
+                    )
                 models: list[str] = []
                 try:
                     body = response.json()
-                    items = (
-                        body.get("models", [])
-                        if backend == Backend.OLLAMA
-                        else body.get("data", [])
-                    )
+                    key = "models" if backend == Backend.OLLAMA else "data"
+                    if not isinstance(body, dict) or not isinstance(body.get(key), list):
+                        raise ValueError("模型端点返回结构无效")
+                    items = body[key]
                     models = [
                         str(item.get("name") or item.get("id"))
-                        for item in items
+                        for item in items[:self.max_reported_models]
                         if isinstance(item, dict)
+                        and (item.get("name") is not None or item.get("id") is not None)
                     ]
-                except (ValueError, AttributeError):
-                    pass
+                except (ValueError, AttributeError, TypeError):
+                    last = ApiCheckResult(
+                        ready=False,
+                        state=RuntimeState.PORT_LISTENING_API_NOT_READY,
+                        status_code=response.status_code,
+                        detail="模型端点返回了无效响应",
+                        checked_url=url,
+                        error_kind="incompatible_endpoint",
+                    )
+                    continue
                 return ApiCheckResult(
                     ready=True,
                     state=RuntimeState.API_READY,
                     status_code=response.status_code,
                     detail=(
                         "API 已就绪"
-                        if endpoint != "/health" else "兼容健康检查已就绪"
                     ),
                     loaded_models=models,
                     checked_url=url,
@@ -134,6 +166,20 @@ def poll_readiness(
             )
         retries += 1
         last = checker.check(address, backend)
+        if cancelled():
+            return ApiCheckResult(
+                ready=False, state=RuntimeState.STOPPED, detail="检查已取消",
+                error_kind="cancelled", retry_count=retries,
+            )
+        if not process_alive():
+            exited = ApiCheckResult(
+                ready=False, state=RuntimeState.FAILED, detail="进程已退出",
+                error_kind="process_exited", retry_count=retries,
+                checked_at=datetime.now(),
+            )
+            if on_result:
+                on_result(exited)
+            return exited
         last.retry_count = retries
         last.checked_at = datetime.now()
         if on_result:
